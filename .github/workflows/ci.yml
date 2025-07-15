@@ -1,0 +1,203 @@
+name: "CI - Build and Test"
+
+on:
+  pull_request:
+  push:
+
+env:
+  GO_VERSION: "~1.24.0"
+
+permissions:
+  id-token: write
+  contents: read
+  attestations: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check Xcode version
+        run: |
+          /usr/bin/xcodebuild -version
+          sudo /usr/bin/xcode-select -switch /Applications/Xcode_16.2.app/Contents/Developer
+          /usr/bin/xcodebuild -version
+
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Lint
+        run: |
+          make lint
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+          check-latest: true
+
+      - name: Build core
+        run: |
+          make core
+
+      - name: Obtain certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+        run: |
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "./Assets/developer-certificate.p12"
+
+      - name: Build for iOS and macOS
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          make ios mac
+          make cleanup
+
+      - name: List build artifacts
+        run: |
+          echo "Contents of Build directory:"
+          ls -la ./Build/
+          
+          # Check for archives
+          if [ -d "./Build/synctrain-ios.xcarchive" ]; then
+            echo "iOS archive found"
+          fi
+          
+          if [ -d "./Build/synctrain-macos.xcarchive" ]; then
+            echo "macOS archive found"
+          fi
+
+      - name: Upload application artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: ./Build
+          retention-days: 3
+
+      - name: Generate artifact attestation for iOS
+        if: success()
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ./Build/synctrain-ios.xcarchive
+
+      - name: Generate artifact attestation for macOS
+        if: success()
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ./Build/synctrain-macos.xcarchive
+
+  test:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check Xcode version
+        run: |
+          /usr/bin/xcodebuild -version
+          sudo /usr/bin/xcode-select -switch /Applications/Xcode_16.2.app/Contents/Developer
+          /usr/bin/xcodebuild -version
+
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+          check-latest: true
+
+      - name: Build core for simulator
+        run: |
+          make core
+
+      - name: Create test simulators
+        run: |
+          # Create two iOS simulators for sync testing
+          xcrun simctl create "SushitrainTest1" "iPhone 15" "iOS-17-5" || echo "Simulator 1 exists"
+          xcrun simctl create "SushitrainTest2" "iPhone 15" "iOS-17-5" || echo "Simulator 2 exists"
+          
+      - name: Boot simulators
+        run: |
+          xcrun simctl boot "SushitrainTest1" || echo "Simulator 1 already booted"
+          xcrun simctl boot "SushitrainTest2" || echo "Simulator 2 already booted"
+          
+          # Wait for simulators to fully boot
+          echo "Waiting for simulators to boot..."
+          sleep 30
+
+      - name: Build app for simulator
+        run: |
+          xcodebuild build \
+            -project Sushitrain.xcodeproj \
+            -scheme Synctrain \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=SushitrainTest1' \
+            -configuration Debug \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            -derivedDataPath ./DerivedData
+
+      - name: Install app on simulators
+        run: |
+          APP_PATH="./DerivedData/Build/Products/Debug-iphonesimulator/Synctrain.app"
+          
+          echo "Installing app on simulator 1..."
+          xcrun simctl install "SushitrainTest1" "$APP_PATH"
+          
+          echo "Installing app on simulator 2..."
+          xcrun simctl install "SushitrainTest2" "$APP_PATH"
+
+      - name: Launch apps
+        run: |
+          echo "Launching app on simulator 1..."
+          xcrun simctl launch "SushitrainTest1" com.pixelspark.sushitrain
+          
+          echo "Launching app on simulator 2..."
+          xcrun simctl launch "SushitrainTest2" com.pixelspark.sushitrain
+          
+          # Give apps time to start
+          sleep 15
+
+      - name: Capture test evidence
+        run: |
+          # Take screenshots
+          xcrun simctl io "SushitrainTest1" screenshot test-sim1-launch.png
+          xcrun simctl io "SushitrainTest2" screenshot test-sim2-launch.png
+          
+          # Get device IDs
+          DEVICE1_ID=$(xcrun simctl list devices | grep "SushitrainTest1" | grep -E -o "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+          DEVICE2_ID=$(xcrun simctl list devices | grep "SushitrainTest2" | grep -E -o "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+          
+          # Check if apps are running
+          if xcrun simctl spawn "$DEVICE1_ID" launchctl list | grep com.pixelspark.sushitrain; then
+            echo "✅ App is running on simulator 1"
+          else
+            echo "❌ App is NOT running on simulator 1"
+            exit 1
+          fi
+          
+          if xcrun simctl spawn "$DEVICE2_ID" launchctl list | grep com.pixelspark.sushitrain; then
+            echo "✅ App is running on simulator 2"
+          else
+            echo "❌ App is NOT running on simulator 2"
+            exit 1
+          fi
+
+      - name: Upload test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-screenshots
+          path: "*.png"
+          retention-days: 3
+
+      - name: Cleanup simulators
+        if: always()
+        run: |
+          xcrun simctl shutdown "SushitrainTest1" || true
+          xcrun simctl shutdown "SushitrainTest2" || true
+          xcrun simctl delete "SushitrainTest1" || true
+          xcrun simctl delete "SushitrainTest2" || true
