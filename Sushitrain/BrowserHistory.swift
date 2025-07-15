@@ -5,14 +5,14 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 import Foundation
 
-struct BrowserHistoryEntry: Codable {
+struct BrowserHistoryEntry: Codable, Tombstonable {
     let id: String  // SHA256 of url+timestamp
     let url: String
-    let title: String
+    var title: String  // Mutable for compaction
     let timestamp: Date
     let deviceName: String
-    let visitDuration: TimeInterval?
-    let referrer: String?
+    var visitDuration: TimeInterval?  // Mutable for compaction
+    var referrer: String?  // Mutable for compaction
     
     // Tombstone fields
     let isTombstone: Bool
@@ -37,9 +37,9 @@ struct BrowserHistoryEntry: Codable {
         self.id = idString.sha256()
     }
     
-    // Create tombstone for an entry
-    static func tombstone(for entry: BrowserHistoryEntry, reason: TombstoneReason) -> BrowserHistoryEntry {
-        var tombstone = entry
+    // Tombstonable protocol implementation
+    func createTombstone(reason: TombstoneReason) -> BrowserHistoryEntry {
+        var tombstone = self
         tombstone.isTombstone = true
         tombstone.tombstoneDate = Date()
         tombstone.tombstoneReason = reason
@@ -52,8 +52,8 @@ struct BrowserHistoryEntry: Codable {
         let dateStr = formatter.string(from: timestamp)
         let sanitizedHost = (URL(string: url)?.host ?? "unknown")
             .replacingOccurrences(of: ".", with: "-")
-        let suffix = isTombstone ? ".tombstone" : ""
-        return "\(dateStr)_\(sanitizedHost)_\(id.prefix(8))\(suffix).json"
+        let baseFilename = "\(dateStr)_\(sanitizedHost)_\(id.prefix(8)).json"
+        return isTombstone ? Self.tombstoneFilename(from: baseFilename) : baseFilename
     }
     
     var relativePath: String {
@@ -64,13 +64,6 @@ struct BrowserHistoryEntry: Codable {
         let day = String(format: "%02d", components.day ?? 0)
         return "\(year)/\(month)/\(day)/\(filename)"
     }
-}
-
-enum TombstoneReason: String, Codable {
-    case expired = "expired"              // Auto-expired based on age
-    case userDeleted = "user_deleted"     // User manually deleted
-    case privacyRule = "privacy_rule"     // Matched privacy/exclude pattern
-    case storageLimit = "storage_limit"   // Exceeded storage limits
 }
 
 // App Group shared storage

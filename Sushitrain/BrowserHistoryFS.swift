@@ -17,12 +17,32 @@ struct BrowserHistoryFSSettings: Codable {
     var autoExpireAfterDays: Int = 90
     var respectTombstones: Bool = true  // Honor tombstones from other devices
     var createTombstones: Bool = true   // Create tombstones when expiring
+    
+    // Compaction settings
+    var enableCompaction: Bool = true
+    var compactAfterDays: Int = 30      // Compact entries older than this
+    var compactionLevel: CompactionLevel = .moderate
+    var tombstoneRetentionDays: Int = 7  // Keep tombstones for this long, then delete
+}
+
+enum CompactionLevel: String, Codable {
+    case minimal = "minimal"     // Keep all metadata
+    case moderate = "moderate"   // Remove referrer, reduce title length
+    case aggressive = "aggressive" // Keep only essential fields
 }
 
 private class BrowserHistoryFS: NSObject {
     private let cacheLock = DispatchSemaphore(value: 1)
     private var cachedRoots: [String: StaticCustomFSDirectory] = [:]
     private let store = BrowserHistoryStore()
+    private var lastCompaction: Date? {
+        get {
+            UserDefaults.standard.object(forKey: "BrowserHistoryLastCompaction") as? Date
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "BrowserHistoryLastCompaction")
+        }
+    }
     
     override init() {
         super.init()
@@ -84,6 +104,9 @@ private class BrowserHistoryFS: NSObject {
         // Process pending entries from extension
         processPendingEntries()
         
+        // Check if compaction is needed
+        checkAndPerformCompaction(settings: settings)
+        
         // Build date-based directory structure from processed entries
         let historyRoot = buildHistoryTree(settings: settings)
         rootChildren.append(historyRoot)
@@ -117,9 +140,42 @@ private class BrowserHistoryFS: NSObject {
         }
     }
     
+    private func checkAndPerformCompaction(settings: BrowserHistoryFSSettings) {
+        guard settings.enableCompaction else { return }
+        
+        // Check if enough time has passed since last compaction
+        let compactionInterval: TimeInterval = 24 * 60 * 60 // Daily
+        if let lastCompaction = lastCompaction,
+           Date().timeIntervalSince(lastCompaction) < compactionInterval {
+            return
+        }
+        
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: BrowserHistoryStore.appGroupIdentifier
+        ) else { return }
+        
+        // Perform compaction in background
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            do {
+                let compactor = BrowserHistoryCompactionManager(
+                    settings: settings,
+                    baseURL: containerURL
+                )
+                try compactor.performCompaction()
+                self?.lastCompaction = Date()
+                
+                // Clear cache to reload compacted data
+                self?.cacheLock.wait()
+                self?.cachedRoots.removeAll()
+                self?.cacheLock.signal()
+            } catch {
+                print("Compaction failed: \(error)")
+            }
+        }
+    }
+    
     private func buildHistoryTree(settings: BrowserHistoryFSSettings) -> CustomFSEntry {
         var yearDirs: [String: MutableCustomFSDirectory] = [:]
-        var seenIds = Set<String>()  // Track seen IDs to handle tombstones
         
         guard let containerURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: BrowserHistoryStore.appGroupIdentifier
@@ -129,86 +185,20 @@ private class BrowserHistoryFS: NSObject {
         
         let processedURL = containerURL.appendingPathComponent("BrowserHistory/processed")
         let cutoffDate = Date().addingTimeInterval(-Double(settings.maxDaysToSync * 24 * 60 * 60))
-        let expirationDate = Date().addingTimeInterval(-Double(settings.autoExpireAfterDays * 24 * 60 * 60))
         
-        // First pass: collect all tombstones
-        var tombstones = Set<String>()
-        if settings.respectTombstones {
-            if let enumerator = FileManager.default.enumerator(at: processedURL, includingPropertiesForKeys: nil) {
-                for case let fileURL as URL in enumerator {
-                    if fileURL.lastPathComponent.contains(".tombstone.json") {
-                        if let data = try? Data(contentsOf: fileURL),
-                           let entry = try? JSONDecoder().decode(BrowserHistoryEntry.self, from: data),
-                           entry.isTombstone {
-                            tombstones.insert(entry.id)
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Second pass: process entries and apply expiration
-        if let enumerator = FileManager.default.enumerator(at: processedURL, includingPropertiesForKeys: [.creationDateKey]) {
+        // Simple enumeration - compaction handles all the complex logic
+        if let enumerator = FileManager.default.enumerator(at: processedURL, includingPropertiesForKeys: nil) {
             for case let fileURL as URL in enumerator {
                 guard fileURL.pathExtension == "json" else { continue }
-                guard !fileURL.lastPathComponent.contains(".tombstone") else { continue }
                 
                 if let data = try? Data(contentsOf: fileURL),
                    let entry = try? JSONDecoder().decode(BrowserHistoryEntry.self, from: data) {
                     
-                    // Skip if tombstoned
-                    if tombstones.contains(entry.id) { continue }
+                    // Skip tombstones in virtual FS
+                    if entry.isTombstone { continue }
                     
-                    // Check if expired
-                    if entry.timestamp < expirationDate && settings.createTombstones {
-                        // Create tombstone
-                        let tombstone = BrowserHistoryEntry.tombstone(for: entry, reason: .expired)
-                        let tombstoneURL = processedURL.appendingPathComponent(tombstone.relativePath)
-                        let tombstoneDir = tombstoneURL.deletingLastPathComponent()
-                        
-                        try? FileManager.default.createDirectory(at: tombstoneDir, withIntermediateDirectories: true)
-                        if let tombstoneData = try? JSONEncoder().encode(tombstone) {
-                            try? tombstoneData.write(to: tombstoneURL)
-                        }
-                        
-                        // Delete original
-                        try? FileManager.default.removeItem(at: fileURL)
-                        continue
-                    }
-                    
-                    // Apply filters
+                    // Apply sync window filter
                     guard entry.timestamp > cutoffDate else { continue }
-                    
-                    if !settings.excludePatterns.isEmpty {
-                        let matches = settings.excludePatterns.contains { pattern in
-                            entry.url.range(of: pattern, options: .regularExpression) != nil
-                        }
-                        if matches {
-                            // Create privacy tombstone if configured
-                            if settings.createTombstones {
-                                let tombstone = BrowserHistoryEntry.tombstone(for: entry, reason: .privacyRule)
-                                let tombstoneURL = processedURL.appendingPathComponent(tombstone.relativePath)
-                                let tombstoneDir = tombstoneURL.deletingLastPathComponent()
-                                
-                                try? FileManager.default.createDirectory(at: tombstoneDir, withIntermediateDirectories: true)
-                                if let tombstoneData = try? JSONEncoder().encode(tombstone) {
-                                    try? tombstoneData.write(to: tombstoneURL)
-                                }
-                                
-                                // Delete original
-                                try? FileManager.default.removeItem(at: fileURL)
-                            }
-                            continue
-                        }
-                    }
-                    
-                    if !settings.includeOnlyDomains.isEmpty {
-                        guard let host = URL(string: entry.url)?.host else { continue }
-                        let matches = settings.includeOnlyDomains.contains { domain in
-                            host.hasSuffix(domain)
-                        }
-                        if !matches { continue }
-                    }
                     
                     // Build directory structure
                     let components = entry.relativePath.split(separator: "/")
@@ -225,7 +215,6 @@ private class BrowserHistoryFS: NSObject {
                         let dayDir = monthDir.getOrCreateSubdirectory(day)
                         
                         dayDir.place(BrowserHistoryFile(filename, data: data, entry: entry))
-                        seenIds.insert(entry.id)
                     }
                 }
             }
