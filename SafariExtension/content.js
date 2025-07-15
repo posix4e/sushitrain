@@ -23,8 +23,8 @@
         action: 'logHistory',
         data: pageData
     }).catch(err => {
-        // Silently fail - don't interrupt browsing
-        console.debug('Sushitrain history capture failed:', err);
+        // Don't interrupt browsing, but log the error
+        console.error('Sushitrain history capture failed:', err);
     });
     
     // Optional: Track time spent on page
@@ -41,7 +41,9 @@
                     url: window.location.href,
                     duration: duration
                 }
-            }).catch(() => {});
+            }).catch(err => {
+                console.error('Sushitrain duration update failed:', err);
+            });
         }
         isVisible = !document.hidden;
         if (isVisible) {
